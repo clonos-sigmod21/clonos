@@ -19,8 +19,6 @@
 package org.apache.flink.runtime.io.network.netty;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.runtime.causal.VertexID;
-import org.apache.flink.runtime.causal.log.job.CausalLogID;
 import org.apache.flink.runtime.io.network.NetworkSequenceViewReader;
 import org.apache.flink.runtime.io.network.partition.BufferAvailabilityListener;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
@@ -128,7 +126,7 @@ class SequenceNumberingViewReader implements BufferAvailabilityListener, Network
 		BufferAndBacklog next = subpartitionView.getNextBuffer();
 		if (next != null) {
 			sequenceNumber++;
-			return new BufferAndAvailability(next.buffer(), next.isMoreAvailable(), next.buffersInBacklog(), next.getEpochID());
+			return new BufferAndAvailability(next.buffer(), next.isMoreAvailable(), next.buffersInBacklog());
 		} else {
 			return null;
 		}

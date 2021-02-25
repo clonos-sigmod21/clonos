@@ -25,27 +25,28 @@ import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import java.io.IOException;
 
 /**
- * Event sent from downstream for replaying in-flight tuples for specific output channel, that is subpartition index, starting from the next appointed checkpoint.
+ * Event sent from operator that completed a local checkpoint (SEEP) to the upstream tasks to truncate their in-flight log respectively.
  */
-public class InFlightLogRequestEvent extends TaskEvent {
+public class CheckpointCompletedEvent extends TaskEvent {
 
 	private IntermediateResultPartitionID intermediateResultPartitionID;
 	private int subpartitionIndex;
+	private int numberBuffersRemoved;
 
 	/**
 	 * Default constructor (should only be used for deserialization).
 	 */
-	public InFlightLogRequestEvent() {
+	public CheckpointCompletedEvent() {
 		// default constructor implementation.
 		// should only be used for deserialization
 	}
 
-
-
-	public InFlightLogRequestEvent(IntermediateResultPartitionID intermediateResultPartitionID, int consumedSubpartitionIndex) {
+	public CheckpointCompletedEvent(IntermediateResultPartitionID intermediateResultPartitionID, int consumedSubpartitionIndex,
+			int numberBuffersRemoved) {
 		super();
 		this.intermediateResultPartitionID = intermediateResultPartitionID;
 		this.subpartitionIndex = consumedSubpartitionIndex;
+		this.numberBuffersRemoved = numberBuffersRemoved;
 	}
 
 	public IntermediateResultPartitionID getIntermediateResultPartitionID() {
@@ -56,12 +57,16 @@ public class InFlightLogRequestEvent extends TaskEvent {
 		return subpartitionIndex;
 	}
 
+	public int getNumberBuffersRemoved() {
+		return numberBuffersRemoved;
+	}
 
 	@Override
 	public void write(final DataOutputView out) throws IOException {
 		out.writeLong(intermediateResultPartitionID.getUpperPart());
 		out.writeLong(intermediateResultPartitionID.getLowerPart());
 		out.writeInt(this.subpartitionIndex);
+		out.writeInt(this.numberBuffersRemoved);
 	}
 
 	@Override
@@ -71,13 +76,15 @@ public class InFlightLogRequestEvent extends TaskEvent {
 		this.intermediateResultPartitionID = new IntermediateResultPartitionID(lower, upper);
 
 		this.subpartitionIndex = in.readInt();
+		this.numberBuffersRemoved = in.readInt();
 	}
 
 	@Override
 	public String toString() {
-		return "InFlightLogRequestEvent{" +
+		return "CheckpointCompletedEvent{" +
 			"intermediateResultPartitionID=" + intermediateResultPartitionID +
 			", subpartitionIndex=" + subpartitionIndex +
+			", numberBuffersRemoved=" + numberBuffersRemoved +
 			'}';
 	}
 }

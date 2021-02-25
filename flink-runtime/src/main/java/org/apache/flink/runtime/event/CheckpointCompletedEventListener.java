@@ -15,36 +15,40 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.flink.runtime.event;
 
-import org.apache.flink.runtime.causal.DeterminantResponseEvent;
 import org.apache.flink.runtime.causal.recovery.RecoveryManager;
+import org.apache.flink.runtime.io.network.partition.ResultPartition;
 import org.apache.flink.runtime.util.event.EventListener;
 
-public class DeterminantResponseEventListener implements EventListener<TaskEvent> {
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/**
+ * A listener to in-flight log requests for replay.
+ */
+public class CheckpointCompletedEventListener implements EventListener<TaskEvent> {
+
+	private static final Logger LOG = LoggerFactory.getLogger(CheckpointCompletedEventListener.class);
 
 	private final ClassLoader userCodeClassLoader;
 	private final RecoveryManager recoveryManager;
-	private final Object checkpointLock;
 
-
-	public DeterminantResponseEventListener(ClassLoader userCodeClassLoader, RecoveryManager recoveryManager,
-											Object checkpointLock) {
+	public CheckpointCompletedEventListener(ClassLoader userCodeClassLoader, RecoveryManager recoveryManager) {
 		this.userCodeClassLoader = userCodeClassLoader;
 		this.recoveryManager = recoveryManager;
-		this.checkpointLock = checkpointLock;
+
 	}
 
 	@Override
 	public void onEvent(TaskEvent event) {
-		if (event instanceof DeterminantResponseEvent) {
-			synchronized (checkpointLock) {
-				recoveryManager.notifyDeterminantResponseEvent((DeterminantResponseEvent) event);
-			}
-		}
-		else {
+		LOG.info("{} received event {}.", this, event);
+		if (event instanceof CheckpointCompletedEvent) {
+			recoveryManager.notifyCheckpointCompletedEvent((CheckpointCompletedEvent) event);
+		} else {
 			throw new IllegalArgumentException(String.format("Unknown event type: %s.", event));
 		}
-
 	}
 }

@@ -18,15 +18,11 @@
 
 package org.apache.flink.streaming.api.operators;
 
-import org.apache.flink.runtime.causal.*;
 import org.apache.flink.runtime.causal.recovery.IRecoveryManager;
-import org.apache.flink.runtime.causal.recovery.LogReplayer;
 import org.apache.flink.runtime.causal.recovery.RecoveryManagerContext;
-import org.apache.flink.runtime.causal.recovery.State;
+import org.apache.flink.runtime.event.CheckpointCompletedEvent;
 import org.apache.flink.runtime.event.InFlightLogRequestEvent;
-import org.apache.flink.runtime.io.network.api.DeterminantRequestEvent;
 import org.apache.flink.runtime.io.network.partition.consumer.InputChannel;
-import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
@@ -110,6 +106,12 @@ public class StreamSourceContextIdleDetectionTests {
 			0,
 			idleTimeout, new IRecoveryManager() {
 				@Override
+				public void notifyCheckpointCompletedEvent(CheckpointCompletedEvent e) {}
+
+				@Override
+				public void notifyCheckpointCompletedUpstreamTasks() {}
+
+				@Override
 				public void notifyNewInputChannel(InputChannel inputChannel, int consumedSupartitionIndex,
 												  int numberBuffersRemoved) {
 
@@ -122,16 +124,6 @@ public class StreamSourceContextIdleDetectionTests {
 
 				@Override
 				public void notifyInFlightLogRequestEvent(InFlightLogRequestEvent e) {
-
-				}
-
-				@Override
-				public void notifyDeterminantResponseEvent(DeterminantResponseEvent e) {
-
-				}
-
-				@Override
-				public void notifyDeterminantRequestEvent(DeterminantRequestEvent e, int channelRequestArrivedFrom) {
 
 				}
 
@@ -175,10 +167,6 @@ public class StreamSourceContextIdleDetectionTests {
 					return null;
 				}
 
-				@Override
-				public LogReplayer getLogReplayer() {
-					return null;
-				}
 
 			});
 
@@ -270,6 +258,12 @@ public class StreamSourceContextIdleDetectionTests {
 			watermarkInterval,
 			idleTimeout, new IRecoveryManager() {
 				@Override
+				public void notifyCheckpointCompletedEvent(CheckpointCompletedEvent e) {}
+
+				@Override
+				public void notifyCheckpointCompletedUpstreamTasks() {}
+
+				@Override
 				public void notifyNewInputChannel(InputChannel inputChannel, int consumedSupartitionIndex,
 												  int numberBuffersRemoved) {
 
@@ -282,16 +276,6 @@ public class StreamSourceContextIdleDetectionTests {
 
 				@Override
 				public void notifyInFlightLogRequestEvent(InFlightLogRequestEvent e) {
-
-				}
-
-				@Override
-				public void notifyDeterminantResponseEvent(DeterminantResponseEvent e) {
-
-				}
-
-				@Override
-				public void notifyDeterminantRequestEvent(DeterminantRequestEvent e, int channelRequestArrivedFrom) {
 
 				}
 
@@ -332,11 +316,6 @@ public class StreamSourceContextIdleDetectionTests {
 
 				@Override
 				public RecoveryManagerContext getContext() {
-					return null;
-				}
-
-				@Override
-				public LogReplayer getLogReplayer() {
 					return null;
 				}
 

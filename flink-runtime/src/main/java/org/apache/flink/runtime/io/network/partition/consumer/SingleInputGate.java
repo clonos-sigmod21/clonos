@@ -21,6 +21,7 @@ package org.apache.flink.runtime.io.network.partition.consumer;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.core.memory.MemorySegment;
+import org.apache.flink.runtime.causal.CheckpointForceable;
 import org.apache.flink.runtime.causal.recovery.RecoveryManager;
 import org.apache.flink.runtime.deployment.InputChannelDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.InputGateDeploymentDescriptor;
@@ -194,6 +195,12 @@ public class SingleInputGate implements InputGate {
 
 	private InputChannel[] inputChannelArray;
 
+	private CheckpointForceable streamTask;
+
+	private long checkpointTimer;
+	private long initialDelay;
+
+
 	private RecoveryManager recoveryManager;
 	public void setRecoveryManager(RecoveryManager recoveryManager){
 		this.recoveryManager = recoveryManager;
@@ -230,6 +237,19 @@ public class SingleInputGate implements InputGate {
 		this.taskActions = checkNotNull(taskActions);
 		this.isCreditBased = isCreditBased;
 
+		this.streamTask = null;
+		this.checkpointTimer = System.currentTimeMillis();
+		this.initialDelay = 20000L;
+
+		Thread t = new Thread(() -> {
+			try {
+				Thread.sleep(100);
+				this.inputChannelsWithData.notifyAll();
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		});
+		t.start();
 	}
 
 	// ------------------------------------------------------------------------
@@ -283,6 +303,14 @@ public class SingleInputGate implements InputGate {
 	@Override
 	public InputChannel getInputChannel(int i) {
 		return inputChannelArray[i];
+	}
+
+	public InputChannel getInputChannelById(int i) {
+		for (InputChannel channel : inputChannels.values()) {
+			if (channel.getChannelIndex() == i)
+				return channel;
+		}
+		return null;
 	}
 
 	@Override
@@ -530,8 +558,8 @@ public class SingleInputGate implements InputGate {
 				try {
 					newChannel.requestSubpartition(consumedSubpartitionIndex);
 					requestedPartitionsFlag.set(true);
-					int numberOfBuffersRemoved = (current instanceof RemoteInputChannel ? ((RemoteInputChannel) current).getNumberOfBuffersRemoved() : 0);
-					recoveryManager.notifyNewInputChannel(newChannel, consumedSubpartitionIndex, numberOfBuffersRemoved);
+					int numberOfBuffersDeduplicate = (current instanceof RemoteInputChannel ? ((RemoteInputChannel) current).getNumberBuffersDeduplicate() : 0);
+					recoveryManager.notifyNewInputChannel(newChannel, consumedSubpartitionIndex, numberOfBuffersDeduplicate);
 				} catch (IOException e) {
 					LOG.error("{}: Request subpartition or send task event for input channel {} failed. Ignoring failure and sending fail trigger for producer (chances are it is dead).",
 						owningTaskName, newChannel, e);
@@ -714,6 +742,7 @@ public class SingleInputGate implements InputGate {
 
 		requestPartitions();
 
+
 		InputChannel currentChannel;
 		boolean moreAvailable;
 		Optional<BufferAndAvailability> result = Optional.empty();
@@ -731,6 +760,15 @@ public class SingleInputGate implements InputGate {
 					}
 					else {
 						return Optional.empty();
+					}
+
+					//Checkpoints can happen at this point, before obtaining the next buffer.
+					// SEEP: take local checkpoint
+					long currentTime = System.currentTimeMillis();
+					if (currentTime - checkpointTimer > 5000L + initialDelay) {
+						streamTask.triggerCheckpoint(currentTime);
+						checkpointTimer = currentTime;
+						initialDelay = 0L;
 					}
 				}
 
@@ -938,6 +976,10 @@ public class SingleInputGate implements InputGate {
 			numUnknownChannels);
 
 		return inputGate;
+	}
+
+	public void setStreamTask(CheckpointForceable streamTask) {
+		this.streamTask = streamTask;
 	}
 
 	@Override

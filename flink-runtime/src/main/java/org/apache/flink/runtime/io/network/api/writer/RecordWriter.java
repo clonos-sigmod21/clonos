@@ -21,18 +21,25 @@ package org.apache.flink.runtime.io.network.api.writer;
 import org.apache.flink.core.io.IOReadableWritable;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.SimpleCounter;
+import org.apache.flink.runtime.causal.EpochStartListener;
+import org.apache.flink.api.common.services.RandomService;
+import org.apache.flink.api.common.services.SimpleRandomService;
+import org.apache.flink.runtime.causal.EpochTracker;
+import org.apache.flink.runtime.causal.EpochTrackerImpl;
 import org.apache.flink.runtime.event.AbstractEvent;
+import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.io.network.api.serialization.EventSerializer;
 import org.apache.flink.runtime.io.network.api.serialization.RecordSerializer;
 import org.apache.flink.runtime.io.network.api.serialization.SpanningRecordSerializer;
 import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
 import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
-import org.apache.flink.util.XORShiftRandom;
+import org.apache.flink.runtime.state.CheckpointListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Optional;
-import java.util.Random;
 
 import static org.apache.flink.runtime.io.network.api.serialization.RecordSerializer.SerializationResult;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -50,25 +57,29 @@ import static org.apache.flink.util.Preconditions.checkState;
  *
  * @param <T> the type of the record that can be emitted with this record writer
  */
-public class RecordWriter<T extends IOReadableWritable> {
+public class RecordWriter<T extends IOReadableWritable> implements EpochStartListener {
+
+	private static final Logger LOG = LoggerFactory.getLogger(RecordWriter.class);
 
 	protected final ResultPartitionWriter targetPartition;
 
-	private final ChannelSelector<T> channelSelector;
+	protected final ChannelSelector<T> channelSelector;
 
-	private final int numChannels;
+	protected final int numChannels;
 
 	private final int[] broadcastChannels;
 
 	private final RecordSerializer<T> serializer;
 
-	private final Optional<BufferBuilder>[] bufferBuilders;
+	protected final Optional<BufferBuilder>[] bufferBuilders;
 
-	private final Random rng = new XORShiftRandom();
+	protected final boolean flushAlways;
 
-	private final boolean flushAlways;
+	private final EpochTracker epochTracker;
 
-	private Counter numBytesOut = new SimpleCounter();
+	protected Counter numBytesOut = new SimpleCounter();
+
+	protected RandomService randomService;
 
 	private Counter numBuffersOut = new SimpleCounter();
 
@@ -78,14 +89,16 @@ public class RecordWriter<T extends IOReadableWritable> {
 
 	@SuppressWarnings("unchecked")
 	public RecordWriter(ResultPartitionWriter writer, ChannelSelector<T> channelSelector) {
-		this(writer, channelSelector, false);
+		this(writer, channelSelector, false, new SimpleRandomService(), new EpochTrackerImpl());
 	}
 
-	public RecordWriter(ResultPartitionWriter writer, ChannelSelector<T> channelSelector, boolean flushAlways) {
+	public RecordWriter(ResultPartitionWriter writer, ChannelSelector<T> channelSelector, boolean flushAlways, RandomService randomService, EpochTracker epochTracker) {
 		this.flushAlways = flushAlways;
 		this.targetPartition = writer;
 		this.channelSelector = channelSelector;
-
+		this.channelSelector.setRandomService(randomService);
+		this.randomService = randomService;
+		this.epochTracker = epochTracker;
 		this.numChannels = writer.getNumberOfSubpartitions();
 
 		this.serializer = new SpanningRecordSerializer<T>();
@@ -96,6 +109,11 @@ public class RecordWriter<T extends IOReadableWritable> {
 			bufferBuilders[i] = Optional.empty();
 		}
 	}
+
+	public ResultPartitionWriter getResultPartition() {
+		return targetPartition;
+	}
+
 
 	public void emit(T record) throws IOException, InterruptedException {
 		emit(record, channelSelector.selectChannels(record, numChannels));
@@ -115,7 +133,7 @@ public class RecordWriter<T extends IOReadableWritable> {
 	public void randomEmit(T record) throws IOException, InterruptedException {
 		serializer.serializeRecord(record);
 
-		if (copyFromSerializerToTargetChannel(rng.nextInt(numChannels))) {
+		if (copyFromSerializerToTargetChannel(randomService.nextInt(numChannels))) {
 			serializer.prune();
 		}
 	}
@@ -173,16 +191,37 @@ public class RecordWriter<T extends IOReadableWritable> {
 	}
 
 	public void broadcastEvent(AbstractEvent event) throws IOException {
-		try (BufferConsumer eventBufferConsumer = EventSerializer.toBufferConsumer(event)) {
+		LOG.info("{}: RecordWriter broadcast event {}.", targetPartition.getTaskName(), event);
+
+		boolean isBarrier = event instanceof CheckpointBarrier;
+		try (BufferConsumer eventBufferConsumer = EventSerializer.toBufferConsumer(event, epochTracker.getCurrentEpoch())) {
 			for (int targetChannel = 0; targetChannel < numChannels; targetChannel++) {
 				tryFinishCurrentBufferBuilder(targetChannel);
 
 				// Retain the buffer so that it can be recycled by each channel of targetPartition
 				targetPartition.addBufferConsumer(eventBufferConsumer.copy(), targetChannel);
 			}
-
 			if (flushAlways) {
 				flushAll();
+			}
+		}
+	}
+
+
+	public void emitEvent(AbstractEvent event, int targetChannel) throws IOException {
+		LOG.info("{}: RecordWriter emit event {}.", targetPartition.getTaskName(), event);
+
+		boolean isBarrier = event instanceof CheckpointBarrier;
+
+		try (BufferConsumer eventBufferConsumer = EventSerializer.toBufferConsumer(event, epochTracker.getCurrentEpoch())) {
+
+			tryFinishCurrentBufferBuilder(targetChannel);
+
+			// retain the buffer so that it can be recycled by each channel of targetPartition
+			targetPartition.addBufferConsumer(eventBufferConsumer.copy(), targetChannel);
+
+			if (flushAlways) {
+				targetPartition.flush(targetChannel);
 			}
 		}
 	}
@@ -192,6 +231,7 @@ public class RecordWriter<T extends IOReadableWritable> {
 	}
 
 	public void clearBuffers() {
+		LOG.debug("Clear buffers.");
 		for (int targetChannel = 0; targetChannel < numChannels; targetChannel++) {
 			closeBufferBuilder(targetChannel);
 		}
@@ -199,7 +239,7 @@ public class RecordWriter<T extends IOReadableWritable> {
 
 	/**
 	 * Sets the metric group for this RecordWriter.
-     */
+	 */
 	public void setMetricGroup(TaskIOMetricGroup metrics) {
 		numBytesOut = metrics.getNumBytesOutCounter();
 		numBuffersOut = metrics.getNumBuffersOutCounter();
@@ -235,7 +275,7 @@ public class RecordWriter<T extends IOReadableWritable> {
 
 		BufferBuilder bufferBuilder = targetPartition.getBufferProvider().requestBufferBuilderBlocking();
 		bufferBuilders[targetChannel] = Optional.of(bufferBuilder);
-		targetPartition.addBufferConsumer(bufferBuilder.createBufferConsumer(), targetChannel);
+		targetPartition.addBufferConsumer(bufferBuilder.createBufferConsumer(epochTracker.getCurrentEpoch()), targetChannel);
 		return bufferBuilder;
 	}
 
@@ -245,4 +285,10 @@ public class RecordWriter<T extends IOReadableWritable> {
 			bufferBuilders[targetChannel] = Optional.empty();
 		}
 	}
+
+	@Override
+	public void notifyEpochStart(long epochID) {
+		channelSelector.notifyEpochStart(epochID);
+	}
+
 }

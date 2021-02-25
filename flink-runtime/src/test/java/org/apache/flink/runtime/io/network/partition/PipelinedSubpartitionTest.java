@@ -20,7 +20,9 @@ package org.apache.flink.runtime.io.network.partition;
 
 import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.core.memory.MemorySegmentFactory;
+import org.apache.flink.runtime.causal.EpochTrackerImpl;
 import org.apache.flink.runtime.event.AbstractEvent;
+import org.apache.flink.runtime.inflightlogging.InMemorySubpartitionInFlightLogger;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
@@ -72,7 +74,7 @@ public class PipelinedSubpartitionTest extends SubpartitionTestBase {
 	PipelinedSubpartition createSubpartition() {
 		final ResultPartition parent = mock(ResultPartition.class);
 
-		return new PipelinedSubpartition(0, parent);
+		return new PipelinedSubpartition(0, parent, new InMemorySubpartitionInFlightLogger());
 	}
 
 	@Test
@@ -274,4 +276,37 @@ public class PipelinedSubpartitionTest extends SubpartitionTestBase {
 		assertEquals(2, partition.getTotalNumberOfBuffers());
 		assertEquals(0, partition.getTotalNumberOfBytes()); // buffer data is never consumed
 	}
+
+
+	@Test
+	public void testReplay() throws Exception {
+		PipelinedSubpartition partition = createSubpartition();
+
+		BufferConsumer buffer1 = createFilledBufferConsumer(100);
+		BufferConsumer buffer2 = createFilledBufferConsumer(200);
+		BufferConsumer chk1 = createFilledBufferConsumer(50);
+		BufferConsumer buffer3 = createFilledBufferConsumer(300);
+		BufferConsumer buffer4 = createFilledBufferConsumer(400);
+		BufferConsumer chk2 = createFilledBufferConsumer(50);
+		partition.add(buffer1);
+		partition.pollBuffer();
+		partition.add(buffer2);
+		partition.add(chk1);
+		partition.add(buffer3);
+		partition.add(buffer4);
+		partition.pollBuffer();
+		partition.pollBuffer();
+		partition.add(chk2);
+		partition.pollBuffer();
+		partition.pollBuffer();
+		partition.pollBuffer();
+		partition.requestReplay(1,0);
+		assertEquals(300, partition.pollBuffer().buffer().getSize());
+		assertEquals(400, partition.pollBuffer().buffer().getSize());
+		assertEquals(50, partition.pollBuffer().buffer().getSize());
+
+		//partition.notifyCheckpointComplete(1);
+		//partition.notifyCheckpointComplete(1);
+	}
+
 }

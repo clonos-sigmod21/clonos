@@ -117,13 +117,15 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 	//  Fetcher work methods
 	// ------------------------------------------------------------------------
 
+
 	@Override
 	public void runFetchLoop() throws Exception {
 		try {
 			final Handover handover = this.handover;
 
 			// kick off the actual Kafka consumer
-			consumerThread.start();
+			if (!consumerThread.isAlive())
+				consumerThread.start();
 
 			while (running) {
 				// this blocks until we get the next records
@@ -146,15 +148,13 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 							running = false;
 							break;
 						}
-
 						// emit the actual record. this also updates offset state atomically
 						// and deals with timestamps and watermark generation
 						emitRecord(value, partition, record.offset(), record);
 					}
 				}
 			}
-		}
-		finally {
+		} finally {
 			// this signals the consumer thread that no more work is to be done
 			consumerThread.shutdown();
 		}
@@ -162,15 +162,14 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 		// on a clean exit, wait for the runner thread
 		try {
 			consumerThread.join();
-		}
-		catch (InterruptedException e) {
+		} catch (InterruptedException e) {
 			// may be the result of a wake-up interruption after an exception.
 			// we ignore this here and only restore the interruption state
 			Thread.currentThread().interrupt();
 		}
 	}
 
-	@Override
+		@Override
 	public void cancel() {
 		// flag the main thread to exit. A thread interrupt will come anyways.
 		running = false;
@@ -230,4 +229,5 @@ public class KafkaFetcher<T> extends AbstractFetcher<T, TopicPartition> {
 		// record the work to be committed by the main consumer thread and make sure the consumer notices that
 		consumerThread.setOffsetsToCommit(offsetsToCommit, commitCallback);
 	}
+
 }

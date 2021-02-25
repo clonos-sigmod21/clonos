@@ -30,6 +30,7 @@ import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.runtime.causal.recovery.IRecoveryManager;
 import org.apache.flink.runtime.state.CheckpointListener;
 import org.apache.flink.runtime.state.DefaultOperatorStateBackend;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
@@ -220,7 +221,10 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 	 */
 	private transient KafkaCommitCallback offsetCommitCallback;
 
+	private boolean initializedRunState;
+
 	// ------------------------------------------------------------------------
+
 
 	/**
 	 * Base constructor.
@@ -235,9 +239,9 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 			List<String> topics,
 			Pattern topicPattern,
 			KeyedDeserializationSchema<T> deserializer,
-			long discoveryIntervalMillis,
-			boolean useMetrics) {
-		this.topicsDescriptor = new KafkaTopicsDescriptor(topics, topicPattern);
+		long discoveryIntervalMillis,
+		boolean useMetrics) {
+			this.topicsDescriptor = new KafkaTopicsDescriptor(topics, topicPattern);
 		this.deserializer = checkNotNull(deserializer, "valueDeserializer");
 
 		checkArgument(
@@ -246,6 +250,7 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 		this.discoveryIntervalMillis = discoveryIntervalMillis;
 
 		this.useMetrics = useMetrics;
+		this.initializedRunState = false;
 	}
 
 	// ------------------------------------------------------------------------
@@ -475,6 +480,7 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 			for (KafkaTopicPartition partition : allPartitions) {
 				if (!restoredState.containsKey(partition)) {
 					restoredState.put(partition, KafkaTopicPartitionStateSentinel.EARLIEST_OFFSET);
+					LOG.info("Put partition {} in restoredState {}.", partition, restoredState);
 				}
 			}
 
@@ -607,8 +613,10 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 		}
 	}
 
-	@Override
-	public void run(SourceContext<T> sourceContext) throws Exception {
+	private void initializeRunState(SourceContext<T> sourceContext) throws Exception{
+		if(initializedRunState)
+			return;
+		initializedRunState = true;
 		if (subscribedPartitionsToStartOffsets == null) {
 			throw new Exception("The partitions were not set for the consumer");
 		}
@@ -637,20 +645,26 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 			sourceContext.markAsTemporarilyIdle();
 		}
 
+
 		// from this point forward:
 		//   - 'snapshotState' will draw offsets from the fetcher,
 		//     instead of being built from `subscribedPartitionsToStartOffsets`
 		//   - 'notifyCheckpointComplete' will start to do work (i.e. commit offsets to
 		//     Kafka through the fetcher, if configured to do so)
 		this.kafkaFetcher = createFetcher(
-				sourceContext,
-				subscribedPartitionsToStartOffsets,
-				periodicWatermarkAssigner,
-				punctuatedWatermarkAssigner,
-				(StreamingRuntimeContext) getRuntimeContext(),
-				offsetCommitMode,
-				getRuntimeContext().getMetricGroup().addGroup(KAFKA_CONSUMER_METRICS_GROUP),
-				useMetrics);
+			sourceContext,
+			subscribedPartitionsToStartOffsets,
+			periodicWatermarkAssigner,
+			punctuatedWatermarkAssigner,
+			(StreamingRuntimeContext) getRuntimeContext(),
+			offsetCommitMode,
+			getRuntimeContext().getMetricGroup().addGroup(KAFKA_CONSUMER_METRICS_GROUP),
+			useMetrics);
+	}
+
+	@Override
+	public void run(SourceContext<T> sourceContext) throws Exception {
+		initializeRunState(sourceContext);
 
 		if (!running) {
 			return;

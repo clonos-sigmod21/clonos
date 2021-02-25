@@ -18,11 +18,19 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import org.apache.flink.runtime.causal.EpochTracker;
+import org.apache.flink.runtime.causal.determinant.BufferBuiltDeterminant;
+import org.apache.flink.runtime.causal.log.job.CausalLogID;
+import org.apache.flink.runtime.causal.log.job.JobCausalLog;
+import org.apache.flink.runtime.causal.log.thread.ThreadCausalLog;
+import org.apache.flink.runtime.causal.recovery.IRecoveryManager;
+import org.apache.flink.runtime.inflightlogging.*;
 import org.apache.flink.runtime.io.network.api.EndOfPartitionEvent;
 import org.apache.flink.runtime.io.network.api.serialization.EventSerializer;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
 
+import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,6 +38,9 @@ import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -37,7 +48,7 @@ import static org.apache.flink.util.Preconditions.checkState;
 /**
  * A pipelined in-memory only subpartition, which can be consumed once.
  *
- * <p>Whenever {@link #add(BufferConsumer)} adds a finished {@link BufferConsumer} or a second
+ * <p>Whenever {@link #add(BufferConsumer, boolean)} adds a finished {@link BufferConsumer} or a second
  * {@link BufferConsumer} (in which case we will assume the first one finished), we will
  * {@link PipelinedSubpartitionView#notifyDataAvailable() notify} a read view created via
  * {@link #createReadView(BufferAvailabilityListener)} of new data availability. Except by calling
@@ -50,28 +61,77 @@ import static org.apache.flink.util.Preconditions.checkState;
  * {@link PipelinedSubpartitionView#notifyDataAvailable() notification} for any
  * {@link BufferConsumer} present in the queue.
  */
-class PipelinedSubpartition extends ResultSubpartition {
+public class PipelinedSubpartition extends ResultSubpartition {
 
 	private static final Logger LOG = LoggerFactory.getLogger(PipelinedSubpartition.class);
 
 	// ------------------------------------------------------------------------
 
-	/** The read view to consume this subpartition. */
+	/**
+	 * The read view to consume this subpartition.
+	 */
 	private PipelinedSubpartitionView readView;
 
-	/** Flag indicating whether the subpartition has been finished. */
+	/**
+	 * Flag indicating whether the subpartition has been finished.
+	 */
 	private boolean isFinished;
 
 	@GuardedBy("buffers")
 	private boolean flushRequested;
 
-	/** Flag indicating whether the subpartition has been released. */
+	/**
+	 * Flag indicating whether the subpartition has been released.
+	 */
 	private volatile boolean isReleased;
-
 	// ------------------------------------------------------------------------
 
-	PipelinedSubpartition(int index, ResultPartition parent) {
+	private final InFlightLog inFlightLog;
+	private ThreadCausalLog subpartitionThreadCausalLog;
+	private IRecoveryManager recoveryManager;
+	private EpochTracker epochTracker;
+
+	private final AtomicBoolean downstreamFailed;
+
+	@GuardedBy("buffers")
+	private InFlightLogIterator<Buffer> inflightReplayIterator;
+
+	@GuardedBy("buffers")
+	private final Deque<BufferConsumer> determinantRequests;
+
+	private final AtomicBoolean isRecoveringSubpartitionInFlightState;
+
+	private final BufferBuiltDeterminant reuseBufferBuiltDeterminant;
+
+	private short vertexID;
+
+	PipelinedSubpartition(int index, ResultPartition parent, InFlightLog inFlightLog) {
 		super(index, parent);
+		this.inFlightLog = inFlightLog;
+		this.downstreamFailed = new AtomicBoolean(false);
+		this.isRecoveringSubpartitionInFlightState = new AtomicBoolean(false);
+		this.determinantRequests = new LinkedList<>();
+		this.reuseBufferBuiltDeterminant = new BufferBuiltDeterminant();
+	}
+
+	public void setIsRecoveringSubpartitionInFlightState(boolean isRecoveringSubpartitionInFlightState) {
+		LOG.debug("Set isRecoveringSubpartitionInFlightState to {}", isRecoveringSubpartitionInFlightState);
+		this.isRecoveringSubpartitionInFlightState.set(isRecoveringSubpartitionInFlightState);
+	}
+
+
+	public void setCausalComponents(IRecoveryManager recoveryManager, JobCausalLog causalLog) {
+		this.recoveryManager = recoveryManager;
+		this.epochTracker = recoveryManager.getContext().getEpochTracker();
+		this.vertexID = recoveryManager.getContext().getTaskVertexID();
+		IntermediateResultPartitionID partitionID = parent.getPartitionId().getPartitionId();
+		CausalLogID causalLogID = new CausalLogID(recoveryManager.getContext().getTaskVertexID(),
+			partitionID.getLowerPart(), partitionID.getUpperPart(), (byte) index);
+		this.subpartitionThreadCausalLog = causalLog.getThreadCausalLog(causalLogID);
+	}
+
+	public InFlightLog getInFlightLog() {
+		return inFlightLog;
 	}
 
 	@Override
@@ -80,8 +140,31 @@ class PipelinedSubpartition extends ResultSubpartition {
 	}
 
 	@Override
+	public void flush() {
+		synchronized (buffers) {
+			if (buffers.isEmpty()) {
+				return;
+			}
+			// if there is more then 1 buffer, we already notified the reader
+			// (at the latest when adding the second buffer)
+			flushRequested = !buffers.isEmpty();
+			if (!isRecoveringSubpartitionInFlightState.get())
+				notifyDataAvailable();
+		}
+	}
+
+	public void bypassDeterminantRequest(BufferConsumer bufferConsumer) {
+		synchronized (buffers) {
+			LOG.debug("Acquired lock to Add determinantRequest buffer consumer");
+			determinantRequests.add(bufferConsumer);
+			flushRequested = true;
+			notifyDataAvailable();
+		}
+	}
+
+	@Override
 	public void finish() throws IOException {
-		add(EventSerializer.toBufferConsumer(EndOfPartitionEvent.INSTANCE), true);
+		add(EventSerializer.toBufferConsumer(EndOfPartitionEvent.INSTANCE, epochTracker.getCurrentEpoch()), true);
 		LOG.debug("{}: Finished {}.", parent.getOwningTaskName(), this);
 	}
 
@@ -102,9 +185,15 @@ class PipelinedSubpartition extends ResultSubpartition {
 			notifyDataAvailable = shouldNotifyDataAvailable() || finish;
 
 			isFinished |= finish;
+
+			if (isRecoveringSubpartitionInFlightState.get())
+				buffers.notifyAll();
+			else if (downstreamFailed.get() || inflightReplayIterator != null)
+				sendFinishedBuffersToInFlightLog();
+
 		}
 
-		if (notifyDataAvailable) {
+		if (notifyDataAvailable && !isRecoveringSubpartitionInFlightState.get()) {
 			notifyDataAvailable();
 		}
 
@@ -120,6 +209,11 @@ class PipelinedSubpartition extends ResultSubpartition {
 			if (isReleased) {
 				return;
 			}
+
+			//inFlightLog.close();
+			//if (inflightReplayIterator != null)
+			//	inflightReplayIterator.close();
+
 
 			// Release all available buffers
 			for (BufferConsumer buffer : buffers) {
@@ -141,58 +235,155 @@ class PipelinedSubpartition extends ResultSubpartition {
 		}
 	}
 
+	public void sendFailConsumerTrigger(Throwable cause) {
+		LOG.debug("Sending fail consumer trigger for Partition {} subpartition {} ", parent.getPartitionId(), index);
+		downstreamFailed.set(true);
+
+		synchronized (buffers) {
+			//If we are  not ourselves recovering
+			if (!isRecoveringSubpartitionInFlightState.get())
+				sendFinishedBuffersToInFlightLog();
+		}
+
+		parent.sendFailConsumerTrigger(index, cause);
+	}
+
+	private void sendFinishedBuffersToInFlightLog() {
+		synchronized (buffers) {
+			while (buffers.size() > 1) {
+				//Send the buffer through the inflight log
+				BufferAndBacklog bnb = getBufferFromQueuedBufferConsumersUnsafe();
+				if (bnb != null)
+					bnb.buffer().recycleBuffer();
+
+			}
+		}
+	}
+
 	@Nullable
 	BufferAndBacklog pollBuffer() {
-		synchronized (buffers) {
-			Buffer buffer = null;
 
-			if (buffers.isEmpty()) {
+		if (downstreamFailed.get()) {
+			LOG.debug("Polling for next buffer, but downstream is still failed.");
+			return null;
+		}
+
+		synchronized (buffers) {
+			if (!determinantRequests.isEmpty()) {
+				LOG.debug("We have a determinant request to send");
+				BufferConsumer consumer = determinantRequests.poll();
+				assert consumer != null;
+				long epochID = consumer.getEpochID();
+				Buffer buffer = consumer.build();
+				consumer.close();
+				int numBuffersInBacklog = getBuffersInBacklog() + (inflightReplayIterator != null ?
+					inflightReplayIterator.numberRemaining() : 0);
+				return new BufferAndBacklog(buffer, inflightReplayIterator != null || isAvailableUnsafe(),
+					numBuffersInBacklog + (inflightReplayIterator != null ? inflightReplayIterator.numberRemaining() :
+						0), nextBufferIsEventUnsafe(), epochID);
+			}
+		}
+
+		if (isRecoveringSubpartitionInFlightState.get()) {
+			LOG.debug("We are still recovering this subpartition, cannot return a buffer yet.");
+			return null;
+		}
+
+		BufferAndBacklog buf;
+		synchronized (buffers) {
+			if (inflightReplayIterator != null) {
+				LOG.debug("We are replaying index {}, get inflight logs next buffer", index);
+				buf = getReplayedBufferUnsafe();
+			} else {
+				LOG.debug("We are not replaying index {}, get buffer from consumers", index);
+				buf = getBufferFromQueuedBufferConsumersUnsafe();
+			}
+		}
+		return buf;
+
+	}
+
+	private BufferAndBacklog getReplayedBufferUnsafe() {
+
+		long epoch = inflightReplayIterator.getEpoch();
+		Buffer buffer = inflightReplayIterator.next();
+
+		int numBuffersInBacklog = getBuffersInBacklog() + inflightReplayIterator.numberRemaining();
+		if (!inflightReplayIterator.hasNext()) {
+			inflightReplayIterator = null;
+			LOG.debug("Finished replaying inflight log!");
+		}
+
+		return new BufferAndBacklog(buffer,
+			inflightReplayIterator != null || isAvailableUnsafe(),
+			numBuffersInBacklog + (inflightReplayIterator != null ? inflightReplayIterator.numberRemaining() : 0),
+			nextBufferIsEventUnsafe(), epoch);
+	}
+
+	private BufferAndBacklog getBufferFromQueuedBufferConsumersUnsafe() {
+		Buffer buffer = null;
+		boolean isFinished = false;
+		long epochID = 0;
+
+		if (buffers.isEmpty()) {
+			flushRequested = false;
+		}
+
+		if (buffers.isEmpty())
+			LOG.debug("Call to getBufferFromQueued, but no buffer consumers to close");
+		while (!buffers.isEmpty()) {
+			BufferConsumer bufferConsumer = buffers.peek();
+			epochID = bufferConsumer.getEpochID();
+
+			buffer = bufferConsumer.build();
+
+			checkState(bufferConsumer.isFinished() || buffers.size() == 1,
+				"When there are multiple buffers, an unfinished bufferConsumer can not be at the head of the " +
+					"buffers queue.");
+
+			if (buffers.size() == 1) {
+				// turn off flushRequested flag if we drained all of the available data
 				flushRequested = false;
 			}
 
-			while (!buffers.isEmpty()) {
-				BufferConsumer bufferConsumer = buffers.peek();
-
-				buffer = bufferConsumer.build();
-
-				checkState(bufferConsumer.isFinished() || buffers.size() == 1,
-					"When there are multiple buffers, an unfinished bufferConsumer can not be at the head of the buffers queue.");
-
-				if (buffers.size() == 1) {
-					// turn off flushRequested flag if we drained all of the available data
-					flushRequested = false;
-				}
-
-				if (bufferConsumer.isFinished()) {
-					buffers.pop().close();
-					decreaseBuffersInBacklogUnsafe(bufferConsumer.isBuffer());
-				}
-
-				if (buffer.readableBytes() > 0) {
-					break;
-				}
-				buffer.recycleBuffer();
-				buffer = null;
-				if (!bufferConsumer.isFinished()) {
-					break;
-				}
+			if (bufferConsumer.isFinished()) {
+				isFinished = true;
+				buffers.pop().close();
+				decreaseBuffersInBacklogUnsafe(bufferConsumer.isBuffer());
 			}
 
-			if (buffer == null) {
-				return null;
+			if (buffer.readableBytes() > 0) {
+				break;
 			}
 
-			updateStatistics(buffer);
-			// Do not report last remaining buffer on buffers as available to read (assuming it's unfinished).
-			// It will be reported for reading either on flush or when the number of buffers in the queue
-			// will be 2 or more.
-			return new BufferAndBacklog(
-				buffer,
-				isAvailableUnsafe(),
-				getBuffersInBacklog(),
-				nextBufferIsEventUnsafe());
+			buffer.recycleBuffer();
+			buffer = null;
+			if (!bufferConsumer.isFinished()) {
+				break;
+			}
 		}
+
+		if (buffer == null) {
+			return null;
+		}
+
+		subpartitionThreadCausalLog.appendDeterminant(reuseBufferBuiltDeterminant.replace(buffer.readableBytes())
+			, epochID);
+		inFlightLog.log(buffer, epochID, isFinished);
+
+		updateStatistics(buffer);
+		BufferAndBacklog result = new BufferAndBacklog(buffer, isAvailableUnsafe(), getBuffersInBacklog(),
+			nextBufferIsEventUnsafe(), epochID);
+		// Do not report last remaining buffer on buffers as available to read (assuming it's unfinished).
+		// It will be reported for reading either on flush or when the number of buffers in the queue
+		// will be 2 or more.
+		if (LOG.isDebugEnabled())
+			LOG.debug("{}:{}: Polled buffer {} (hash: {}, memorySegment hash: {}). Buffers available for dispatch: {}."
+				, parent, this, buffer, System.identityHashCode(buffer),
+				System.identityHashCode(buffer.getMemorySegment()), getBuffersInBacklog());
+		return result;
 	}
+
 
 	boolean nextBufferIsEvent() {
 		synchronized (buffers) {
@@ -202,7 +393,8 @@ class PipelinedSubpartition extends ResultSubpartition {
 
 	private boolean nextBufferIsEventUnsafe() {
 		assert Thread.holdsLock(buffers);
-
+		if (inflightReplayIterator != null)
+			return !inflightReplayIterator.peekNext().isBuffer();
 		return !buffers.isEmpty() && !buffers.peekFirst().isBuffer();
 	}
 
@@ -220,30 +412,39 @@ class PipelinedSubpartition extends ResultSubpartition {
 
 	@Override
 	public PipelinedSubpartitionView createReadView(BufferAvailabilityListener availabilityListener) throws IOException {
-		final boolean notifyDataAvailable;
 		synchronized (buffers) {
 			checkState(!isReleased);
-			checkState(readView == null,
-					"Subpartition %s of is being (or already has been) consumed, " +
-					"but pipelined subpartitions can only be consumed once.", index, parent.getPartitionId());
 
-			LOG.debug("{}: Creating read view for subpartition {} of partition {}.",
-				parent.getOwningTaskName(), index, parent.getPartitionId());
+			if (readView == null) {
+				LOG.debug("Creating read view for {} (index: {}) of partition {}.", this, index,
+					parent.getPartitionId());
 
-			readView = new PipelinedSubpartitionView(this, availabilityListener);
-			notifyDataAvailable = !buffers.isEmpty();
+				readView = new PipelinedSubpartitionView(this, availabilityListener);
+			} else {
+				readView.setAvailabilityListener(availabilityListener);
+				LOG.debug("(Re)using read view {} for {} (index: {}) of partition {}.", readView, this, index,
+					parent.getPartitionId());
+			}
+
+
 		}
-		if (notifyDataAvailable) {
+		//If we are recovering, when we conclude, we must notify of data availability.
+		if (recoveryManager == null || !recoveryManager.isRecovering()) {
 			notifyDataAvailable();
+		} else {
+			recoveryManager.notifyNewOutputChannel(parent.getPartitionId().getPartitionId(), index);
+
 		}
 
 		return readView;
 	}
 
 	public boolean isAvailable() {
+		boolean result;
 		synchronized (buffers) {
-			return isAvailableUnsafe();
+			result = isAvailableUnsafe();
 		}
+		return result;
 	}
 
 	private boolean isAvailableUnsafe() {
@@ -280,32 +481,36 @@ class PipelinedSubpartition extends ResultSubpartition {
 	@Override
 	public int unsynchronizedGetNumberOfQueuedBuffers() {
 		// since we do not synchronize, the size may actually be lower than 0!
-		return Math.max(buffers.size(), 0);
+		return Math.max(buffers.size() + (inflightReplayIterator != null ? inflightReplayIterator.numberRemaining() :
+			0), 0);
 	}
 
-	@Override
-	public void flush() {
-		final boolean notifyDataAvailable;
+	public void requestReplay(long checkpointId, int ignoreMessages) {
+		LOG.debug("Replay requested");
 		synchronized (buffers) {
-			if (buffers.isEmpty()) {
-				return;
+			if (inflightReplayIterator != null)
+				inflightReplayIterator.close();
+			inflightReplayIterator = inFlightLog.getInFlightIterator(checkpointId, ignoreMessages);
+			if (inflightReplayIterator != null) {
+				LOG.debug("Replay has been requested for pipelined subpartition of id {}, index {}, skipping {} " +
+						"buffers, " +
+						"buffers to replay {}. Setting downstreamFailed to false", this.parent.getPartitionId(),
+					this.index,
+					ignoreMessages, inflightReplayIterator.numberRemaining());
+				if (!inflightReplayIterator.hasNext())
+					inflightReplayIterator = null;
 			}
-			// if there is more then 1 buffer, we already notified the reader
-			// (at the latest when adding the second buffer)
-			notifyDataAvailable = !flushRequested && buffers.size() == 1;
-			flushRequested = true;
-		}
-		if (notifyDataAvailable) {
-			notifyDataAvailable();
+			downstreamFailed.set(false);
 		}
 	}
+
 
 	private boolean shouldNotifyDataAvailable() {
 		// Notify only when we added first finished buffer.
 		return readView != null && !flushRequested && getNumberOfFinishedBuffers() == 1;
 	}
 
-	private void notifyDataAvailable() {
+	public void notifyDataAvailable() {
 		if (readView != null) {
 			readView.notifyDataAvailable();
 		}
@@ -318,10 +523,87 @@ class PipelinedSubpartition extends ResultSubpartition {
 		// worst-case: a single finished buffer sits around until the next flush() call
 		// (but we do not offer stronger guarantees anyway)
 		if (buffers.size() == 1 && buffers.peekLast().isFinished()) {
+			if (inflightReplayIterator != null)
+				return 1 + inflightReplayIterator.numberRemaining();
 			return 1;
 		}
 
 		// We assume that only last buffer is not finished.
-		return Math.max(0, buffers.size() - 1);
+		return Math.max(0, buffers.size() + (inflightReplayIterator != null ?
+			inflightReplayIterator.numberRemaining() : 0) - 1);
+	}
+
+	public void buildAndLogBuffer(int bufferSize) throws InterruptedException {
+		LOG.debug("building buffer of size {} and discarding result", bufferSize);
+		synchronized (buffers) {
+			while (true) {
+				BufferConsumer consumer = buffers.peek();
+
+				//No consumer ready
+				if (consumer == null) {
+					buffers.wait(5);
+					continue;
+				}
+
+				//Empty consumer (No dataflow between checkpoints)
+				if (consumer.isFinished() && consumer.getUnreadBytes() <= 0) {
+					buffers.pop().close();
+					continue;
+				}
+
+				// Erroneous state, consumer is finished without enough data, throw exception
+				if (consumer.isFinished() && consumer.getUnreadBytes() > 0 && consumer.getUnreadBytes() < bufferSize) {
+					String msg = "Vertex " + recoveryManager.getContext().getTaskVertexID() + " - Size of finished bufferConsumer ( unread: " + consumer.getUnreadBytes() +
+						", written: " + consumer.getWrittenBytes() +
+						") does not match size of recovery request to build buffer ( " + bufferSize + " ).";
+					LOG.info("Exception:" + msg);
+					throw new RuntimeException(msg);
+				}
+				//If there is enough data in consumer for building the correct buffer
+				if (consumer.getUnreadBytes() >= bufferSize) {
+					buildRequestedBuffer(bufferSize, consumer);
+					break;
+				}
+
+				buffers.wait(5);
+			}
+		}
+		LOG.debug("Done building and discarding bufer of size {}", bufferSize);
+	}
+
+	private void buildRequestedBuffer(int bufferSize, BufferConsumer consumer) {
+		LOG.debug("There are enough bytes to build the requested buffer!");
+
+		long epochID = consumer.getEpochID();
+		//This assumes that the input buffers which are before this close in the determinant log have
+		// been
+		// fully processed, thus the bufferconsumer will have this amount of data.
+		subpartitionThreadCausalLog.appendDeterminant(reuseBufferBuiltDeterminant.replace(bufferSize), epochID);
+		Buffer buffer = consumer.build(bufferSize);
+
+
+		checkState(consumer.isFinished() || buffers.size() == 1,
+			"When there are multiple buffers, an unfinished bufferConsumer can not be at the head of" +
+				" " +
+				"the buffers queue.");
+
+		if (buffers.size() == 1) {
+			// turn off flushRequested flag if we drained all of the available data
+			flushRequested = false;
+		}
+
+
+		updateStatistics(buffer);
+		inFlightLog.log(buffer, epochID, true);
+		buffer.recycleBuffer(); //It is not sent downstream, so we must recycle it here.
+	}
+
+	@Override
+	public short getVertexID() {
+		return vertexID;
+	}
+
+	public boolean isRecoveringSubpartititionInFlightState() {
+		return isRecoveringSubpartitionInFlightState.get();
 	}
 }

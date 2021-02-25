@@ -22,6 +22,8 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.CompatibilityResult;
 import org.apache.flink.api.common.typeutils.CompatibilityUtil;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.runtime.causal.determinant.ProcessingTimeCallbackID;
+import org.apache.flink.runtime.causal.recovery.RecoveryManager;
 import org.apache.flink.runtime.state.InternalPriorityQueue;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
@@ -30,6 +32,8 @@ import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -44,6 +48,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * {@link InternalTimerService} that stores timers on the Java heap.
  */
 public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, ProcessingTimeCallback {
+
 
 	private final ProcessingTimeService processingTimeService;
 
@@ -95,13 +100,15 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 	/** The restored timers snapshot, if any. */
 	private InternalTimersSnapshot<K, N> restoredTimersSnapshot;
 
-	InternalTimerServiceImpl(
-		KeyGroupRange localKeyGroupRange,
-		KeyContext keyContext,
-		ProcessingTimeService processingTimeService,
-		KeyGroupedInternalPriorityQueue<TimerHeapInternalTimer<K, N>> processingTimeTimersQueue,
-		KeyGroupedInternalPriorityQueue<TimerHeapInternalTimer<K, N>> eventTimeTimersQueue) {
+	private final ProcessingTimeCallbackID processingTimeCallbackID;
 
+		InternalTimerServiceImpl(
+			String name,
+			KeyGroupRange localKeyGroupRange,
+			KeyContext keyContext,
+			ProcessingTimeService processingTimeService,
+			KeyGroupedInternalPriorityQueue<TimerHeapInternalTimer<K, N>> processingTimeTimersQueue,
+			KeyGroupedInternalPriorityQueue<TimerHeapInternalTimer<K, N>> eventTimeTimersQueue) {
 		this.keyContext = checkNotNull(keyContext);
 		this.processingTimeService = checkNotNull(processingTimeService);
 		this.localKeyGroupRange = checkNotNull(localKeyGroupRange);
@@ -114,6 +121,7 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 			startIdx = Math.min(keyGroupIdx, startIdx);
 		}
 		this.localKeyGroupRangeStartIdx = startIdx;
+		this.processingTimeCallbackID = new ProcessingTimeCallbackID(name);
 	}
 
 	/**
@@ -183,7 +191,7 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 
 	@Override
 	public long currentProcessingTime() {
-		return processingTimeService.getCurrentProcessingTime();
+		return processingTimeService.getCurrentProcessingTimeCausal();
 	}
 
 	@Override
@@ -240,6 +248,11 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 		}
 	}
 
+	@Override
+	public ProcessingTimeCallbackID getID() {
+		return processingTimeCallbackID;
+	}
+
 	public void advanceWatermark(long time) throws Exception {
 		currentWatermark = time;
 
@@ -259,6 +272,7 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 	 * @return a snapshot containing the timers for the given key-group, and the serializers for them
 	 */
 	public InternalTimersSnapshot<K, N> snapshotTimersForKeyGroup(int keyGroupIdx) {
+
 		return new InternalTimersSnapshot<>(
 			keySerializer,
 			keySerializer.snapshotConfiguration(),
@@ -279,10 +293,10 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 	public void restoreTimersForKeyGroup(InternalTimersSnapshot<?, ?> restoredSnapshot, int keyGroupIdx) {
 		this.restoredTimersSnapshot = (InternalTimersSnapshot<K, N>) restoredSnapshot;
 
-		if (areSnapshotSerializersIncompatible(restoredSnapshot)) {
-			throw new IllegalArgumentException("Tried to restore timers " +
-				"for the same service with different serializers.");
-		}
+		//if (areSnapshotSerializersIncompatible(restoredSnapshot)) {
+		//	throw new IllegalArgumentException("Tried to restore timers " +
+		//		"for the same service with different serializers.");
+		//}
 
 		this.keyDeserializer = restoredTimersSnapshot.getKeySerializer();
 		this.namespaceDeserializer = restoredTimersSnapshot.getNamespaceSerializer();
@@ -359,4 +373,6 @@ public class InternalTimerServiceImpl<K, N> implements InternalTimerService<N>, 
 		return (this.keyDeserializer != null && !this.keyDeserializer.equals(restoredSnapshot.getKeySerializer())) ||
 			(this.namespaceDeserializer != null && !this.namespaceDeserializer.equals(restoredSnapshot.getNamespaceSerializer()));
 	}
+
+
 }
